@@ -396,6 +396,15 @@ impl<'a>
                         dtls_handshake_config,
                         None,
                     )?;
+                    // `connect` queued the first flight. Take it now, or it waits in the
+                    // endpoint until the next `handle_timeout` drains it.
+                    while let Some(transmit) = dtls_endpoint.poll_transmit() {
+                        self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
+                            now: transmit.now,
+                            transport: transmit.transport,
+                            message: RTCMessageInternal::Dtls(DTLSMessage::Raw(transmit.message)),
+                        });
+                    }
                 };
             }
         } else {
@@ -561,6 +570,73 @@ mod tests {
         let mut handler = DtlsHandler::new(&mut context, &mut stats);
 
         sansio::Protocol::handle_timeout(&mut handler, Instant::now()).unwrap();
+    }
+
+    /// A DTLS client's first flight leaves on the event that starts it.
+    ///
+    /// Before the fix, `connect` queued the ClientHello inside the endpoint and
+    /// nothing took it until the next `handle_timeout`, so the handshake waited
+    /// out whatever timer fired next. The ClientHello must be in `write_outs`
+    /// as soon as the selected-pair event is handled, with no timeout driven.
+    #[test]
+    fn a_dtls_client_queues_its_client_hello_when_the_pair_is_selected() -> Result<()> {
+        use crate::crypto::SignatureScheme;
+        use crate::peer_connection::certificate::{CertificateParams, RTCCertificate};
+        use crate::peer_connection::transport::dtls::parameters::RTCDtlsParameters;
+        use crate::peer_connection::transport::ice::role::RTCIceRole;
+
+        let provider =
+            crypto::default_provider().expect("a built-in crypto provider is enabled for tests");
+        let certificate = RTCCertificate::generate(
+            provider.crypto(),
+            SignatureScheme::EcdsaP256Sha256,
+            CertificateParams::new(vec!["localhost".to_owned()]).expect("certificate params"),
+        )?;
+        let mut transport = DtlsTransport::new(
+            crate::peer_connection::transport::dtls::RTCDtlsTransportConfig {
+                id: test_transport_id(TransportKind::Dtls),
+                ice_transport_id: test_transport_id(TransportKind::Ice),
+                certificates: vec![certificate],
+                answering_dtls_role: Default::default(),
+                srtp_protection_profiles: vec![],
+                dtls_cipher_suites: vec![],
+                allow_insecure_verification_algorithm: false,
+                disable_certificate_fingerprint_verification: true,
+                replay_protection: Default::default(),
+                crypto_provider: provider,
+            },
+        )?;
+        // A remote server makes this side the client.
+        transport.start(
+            RTCIceRole::Controlling,
+            RTCDtlsParameters {
+                role: RTCDtlsRole::Server,
+                fingerprints: vec![],
+            },
+        )?;
+        assert_eq!(transport.role(), RTCDtlsRole::Client);
+
+        let mut context = DtlsHandlerContext::new(transport);
+        let mut stats = RTCStatsAccumulator::default();
+        let mut handler = DtlsHandler::new(&mut context, &mut stats);
+        sansio::Protocol::handle_event(
+            &mut handler,
+            TaggedRTCEventInternal {
+                now: Instant::now(),
+                event: RTCEventInternal::ICESelectedCandidatePairChange,
+            },
+        )?;
+
+        let first = sansio::Protocol::poll_write(&mut handler)
+            .expect("the ClientHello is queued without waiting for a timeout");
+        match first.message {
+            RTCMessageInternal::Dtls(DTLSMessage::Raw(bytes)) => {
+                // A DTLS handshake record: content type 22.
+                assert_eq!(bytes.first(), Some(&22u8), "a handshake record");
+            }
+            other => panic!("expected a raw DTLS record, got {other:?}"),
+        }
+        Ok(())
     }
 
     // The handshake path is the only writer of `remote_certificates`. A test that assigns the
