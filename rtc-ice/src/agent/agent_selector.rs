@@ -540,6 +540,12 @@ impl ControlledSelector for Agent {
                     self.remote_candidates[p.remote_index].addr(),
                     rtt.as_millis()
                 );
+
+                // RFC 8445 §7.3.1.5: a pair nominated while its check was in progress
+                // becomes the selected pair when that check succeeds.
+                if p.nominated && self.get_selected_pair().is_none() {
+                    self.set_selected_pair(Some(now), Some(pair_index));
+                }
             } else {
                 // This shouldn't happen
                 error!("Success response from invalid candidate pair");
@@ -590,6 +596,17 @@ impl ControlledSelector for Agent {
                     // MUST remove the candidate pair from the valid list, set the
                     // candidate pair state to Failed, and set the checklist state to
                     // Failed.
+                    //
+                    // The flag is recorded now and acted on in `handle_success_response`.
+                    // The request itself passed authentication, so it is answered
+                    // (Section 7.3): leaving it unanswered made the controlling agent
+                    // repeat the nomination on its next check tick, ~200 ms later.
+                    self.candidate_pairs[pair_index].nominated = true;
+                    trace!(
+                        "controlledSelector: nomination on in-progress pair {}, selecting when its check succeeds",
+                        self.candidate_pairs[pair_index]
+                    );
+                    self.send_binding_success(now, m, local_index, remote_index);
                     self.ping_candidate(now, local_index, remote_index);
                 }
             } else {

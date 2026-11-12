@@ -3540,6 +3540,121 @@ fn test_controlling_waits_while_a_strictly_better_pair_is_still_checking() -> Re
     Ok(())
 }
 
+// The controlled side of the same race (2026-11-12, after early nomination landed): the
+// phone nominated 1.4 ms into checking, before the VM's own check on the pair had come back.
+// The VM sent a triggered check but no response to the USE-CANDIDATE request and kept no
+// record of the nomination, so the phone's next nomination, a 200 ms tick later, was the
+// one that connected. RFC 8445 §7.3.1.5: an in-progress pair's nominated flag is set when
+// its triggered check succeeds; §7.3: an authenticated request is answered.
+
+/// A controlled agent in `Checking` at `t0` with one host pair, still in progress.
+fn controlled_agent_with_one_pair(t0: Instant) -> Result<(Agent, usize)> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.64.2:53297", 0)?)?;
+    a.add_remote_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remoteufrag".to_string(),
+        pwd: "remotepwdremotepwdremotepwd".to_string(),
+    });
+    a.is_controlling = false;
+    a.start(t0);
+    a.connection_state = ConnectionState::Checking;
+    let pair = a.find_pair(0, 0).expect("the host pair");
+    Ok((a, pair))
+}
+
+fn inbound_nomination() -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(UseCandidateAttr::new()),
+    ])?;
+    Ok(m)
+}
+
+/// Whether a binding success response for `tid` was written.
+fn answered(a: &Agent, tid: TransactionId) -> bool {
+    a.write_outs.iter().any(|out| {
+        let mut m = Message::new();
+        m.raw = out.message.to_vec();
+        m.decode().is_ok() && m.typ == BINDING_SUCCESS && m.transaction_id == tid
+    })
+}
+
+#[test]
+fn test_controlled_answers_nomination_on_in_progress_pair() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, pair) = controlled_agent_with_one_pair(t0)?;
+    let nomination = inbound_nomination()?;
+
+    a.handle_binding_request(t0 + Duration::from_millis(1), &nomination, 0, 0);
+
+    assert!(
+        answered(&a, nomination.transaction_id),
+        "an authenticated USE-CANDIDATE request must be answered even before our check succeeds"
+    );
+    assert!(
+        a.candidate_pairs[pair].nominated,
+        "the nomination must be remembered"
+    );
+    assert!(
+        a.selected_pair.is_none(),
+        "an in-progress pair is not selected yet"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlled_selects_nominated_pair_when_its_check_succeeds() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, pair) = controlled_agent_with_one_pair(t0)?;
+    let remote = SocketAddr::from_str("192.168.14.154:65143")?;
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: t0,
+        transaction_id: tid,
+        destination: remote,
+        is_use_candidate: false,
+    });
+
+    // The nomination overtakes the response to our own check.
+    a.handle_binding_request(t0 + Duration::from_millis(1), &inbound_nomination()?, 0, 0);
+    let mut success = Message::new();
+    success.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    a.handle_success_response(t0 + Duration::from_millis(2), &success, 0, 0, remote);
+
+    assert_eq!(
+        a.selected_pair,
+        Some(pair),
+        "a nominated pair is selected when its check succeeds, without a second nomination"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlled_does_not_select_unnominated_pair_on_success() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _pair) = controlled_agent_with_one_pair(t0)?;
+    let remote = SocketAddr::from_str("192.168.14.154:65143")?;
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: t0,
+        transaction_id: tid,
+        destination: remote,
+        is_use_candidate: false,
+    });
+    let mut success = Message::new();
+    success.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    a.handle_success_response(t0 + Duration::from_millis(2), &success, 0, 0, remote);
+
+    assert!(
+        a.selected_pair.is_none(),
+        "the controlled agent selects only what the controlling agent nominated"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_controlling_early_nomination_respects_acceptance_min_wait() -> Result<()> {
     let t0 = Instant::now();
