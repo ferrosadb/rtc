@@ -80,6 +80,63 @@ impl Agent {
         now.saturating_duration_since(self.start_time) > min_wait
     }
 
+    /// The highest priority among pairs that have not failed, i.e. the best any pending check
+    /// could still produce.
+    fn best_available_priority(&self) -> Option<u64> {
+        self.candidate_pairs
+            .iter()
+            .filter(|p| p.state != CandidatePairState::Failed)
+            .map(|p| p.priority())
+            .max()
+    }
+
+    /// Controlling agent only: nominates `pair_index` at once, instead of on the next check
+    /// tick, when no later tick could make a better choice.
+    ///
+    /// That holds when the pair has succeeded, no pair that has not failed has a strictly
+    /// higher priority, and both candidates have waited out their type's acceptance min wait.
+    /// Priority is compared, not pair index: equal-priority pairs (every host/host pair) are
+    /// interchangeable, and comparing indices let an unreachable pair that sorted first block
+    /// nomination until the tick. Returns whether it nominated.
+    fn nominate_early_if_best(&mut self, now: Instant, pair_index: usize) -> bool {
+        debug_assert!(self.is_controlling, "only the controlling agent nominates");
+        if self.nominated_pair.is_some() || self.get_selected_pair().is_some() {
+            return false;
+        }
+        let p = self.candidate_pairs[pair_index];
+        if p.state != CandidatePairState::Succeeded {
+            return false;
+        }
+        let Some(best) = self.best_available_priority() else {
+            error!("nominate_early_if_best: a succeeded pair exists but no pair is available");
+            return false;
+        };
+        if p.priority() < best {
+            trace!(
+                "controllingSelector: {} succeeded but a better pair (priority {}) is still checking",
+                p, best
+            );
+            return false;
+        }
+        if !(self.is_nominatable(now, p.local_index, true)
+            && self.is_nominatable(now, p.remote_index, false))
+        {
+            trace!(
+                "controllingSelector: {} is best but inside its acceptance min wait",
+                p
+            );
+            return false;
+        }
+        trace!(
+            "The candidate ({}, {}) is the best candidate available, marking it as nominated",
+            p.local_index, p.remote_index
+        );
+        self.candidate_pairs[pair_index].nominated = true;
+        self.nominated_pair = Some(pair_index);
+        self.nominate_pair(now);
+        true
+    }
+
     fn nominate_pair(&mut self, now: Instant) {
         let result = {
             let Some(remote_credentials) = &self.ufrag_pwd.remote_credentials else {
@@ -337,6 +394,10 @@ impl ControllingSelector for Agent {
                 );
                 if pending_request.is_use_candidate && selected_pair_is_none {
                     self.set_selected_pair(Some(now), Some(pair_index));
+                } else {
+                    // This success may be what makes the best pair valid; the peer's own
+                    // check can arrive before it, so the request path alone can miss it.
+                    self.nominate_early_if_best(now, pair_index);
                 }
             } else {
                 // This shouldn't happen
@@ -365,39 +426,13 @@ impl ControllingSelector for Agent {
             self.candidate_pairs[pair_index].on_request_received();
 
             let p = &self.candidate_pairs[pair_index];
-            let nominated_pair_is_none = self.nominated_pair.is_none();
-
             trace!(
                 "controllingSelector: after findPair {}, p.state: {}, {}",
                 p,
                 p.state,
-                nominated_pair_is_none,
-                //self.get_selected_pair().await.is_none() //, {}
+                self.nominated_pair.is_none(),
             );
-            if p.state == CandidatePairState::Succeeded
-                && nominated_pair_is_none
-                && self.get_selected_pair().is_none()
-            {
-                if let Some(best_pair_index) = self.get_best_available_pair() {
-                    trace!(
-                        "controllingSelector: getBestAvailableCandidatePair {}",
-                        best_pair_index
-                    );
-                    if best_pair_index == pair_index
-                        && self.is_nominatable(now, p.local_index, true)
-                        && self.is_nominatable(now, p.remote_index, false)
-                    {
-                        trace!(
-                            "The candidate ({}, {}) is the best candidate available, marking it as nominated",
-                            p.local_index, p.remote_index
-                        );
-                        self.nominated_pair = Some(pair_index);
-                        self.nominate_pair(now);
-                    }
-                } else {
-                    trace!("No best pair available");
-                }
-            }
+            self.nominate_early_if_best(now, pair_index);
         } else {
             trace!("controllingSelector: addPair");
             self.add_pair(local_index, remote_index);

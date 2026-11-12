@@ -3386,3 +3386,174 @@ fn test_stats_snapshot_reports_the_callers_instant_throughout() -> Result<()> {
 
     Ok(())
 }
+
+// Early nomination by the controlling agent.
+//
+// Measured on a phone -> VM connect (2026-11-12): the phone's IPv4 host pair succeeded
+// within ~1.4 ms of checking, but nomination waited ~200 ms for the next check tick. The
+// phone also had IPv6 host candidates whose pairs to the VM never succeed; every host/host
+// pair has the same priority, and the unreachable one sorted first. The inbound-request
+// path compared pair INDICES (`best_available == this pair`), so the tie made it refuse,
+// and nothing on the success-response path nominated at all.
+
+const TIED_UNREACHABLE: &str = "10.99.0.1:5000";
+const TIED_REACHABLE: &str = "192.168.64.2:53297";
+
+fn host_candidate(addr: &str, priority: u32) -> Result<Candidate> {
+    let sa = SocketAddr::from_str(addr)?;
+    CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: sa.ip().to_string(),
+            port: sa.port(),
+            component: 1,
+            priority,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()
+}
+
+/// A controlling agent in `Checking` at `t0` with one local host candidate and two remote
+/// host candidates. The first remote (added first, so its pair sorts first) never answers.
+fn controlling_agent_with_two_remote_hosts(
+    t0: Instant,
+    unreachable_priority: u32,
+) -> Result<(Agent, usize, usize)> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.add_remote_candidate(host_candidate(TIED_UNREACHABLE, unreachable_priority)?)?;
+    a.add_remote_candidate(host_candidate(TIED_REACHABLE, 0)?)?;
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remoteufrag".to_string(),
+        pwd: "remotepwdremotepwdremotepwd".to_string(),
+    });
+    a.is_controlling = true;
+    a.start(t0);
+    a.connection_state = ConnectionState::Checking;
+    let unreachable = a.find_pair(0, 0).expect("pair to the unreachable remote");
+    let reachable = a.find_pair(0, 1).expect("pair to the reachable remote");
+    assert!(
+        unreachable < reachable,
+        "the unreachable pair must sort first"
+    );
+    Ok((a, unreachable, reachable))
+}
+
+fn inbound_binding_request() -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
+    Ok(m)
+}
+
+/// Registers an outstanding check to the reachable remote and returns its success response.
+fn outstanding_check_and_its_success(a: &mut Agent, sent: Instant) -> Result<Message> {
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: sent,
+        transaction_id: tid,
+        destination: SocketAddr::from_str(TIED_REACHABLE)?,
+        is_use_candidate: false,
+    });
+    let mut m = Message::new();
+    m.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    Ok(m)
+}
+
+fn sent_use_candidate(a: &Agent) -> bool {
+    a.pending_binding_requests
+        .iter()
+        .any(|r| r.is_use_candidate)
+}
+
+#[test]
+fn test_controlling_nominates_on_request_despite_equal_priority_pair_sorting_first() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    assert_eq!(
+        a.candidate_pairs[unreachable].priority(),
+        a.candidate_pairs[reachable].priority(),
+        "precondition: the two host pairs tie on priority"
+    );
+    a.candidate_pairs[reachable].state = CandidatePairState::Succeeded;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "a succeeded pair tied for the best priority must be nominated without waiting for a tick"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
+
+#[test]
+fn test_controlling_nominates_when_success_arrives_after_peer_request() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    // The peer's own check arrives first, while our check is still in flight.
+    a.handle_binding_request(
+        t0 + Duration::from_millis(1),
+        &inbound_binding_request()?,
+        0,
+        1,
+    );
+    assert!(
+        a.nominated_pair.is_none(),
+        "an in-progress pair cannot be nominated"
+    );
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "the success that makes the best pair valid must nominate it without waiting for a tick"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
+
+#[test]
+fn test_controlling_waits_while_a_strictly_better_pair_is_still_checking() -> Result<()> {
+    let t0 = Instant::now();
+    // The pair that has not answered yet is strictly better than the one that did.
+    let (mut a, unreachable, reachable) =
+        controlling_agent_with_two_remote_hosts(t0, u32::MAX / 2)?;
+    assert!(a.candidate_pairs[unreachable].priority() > a.candidate_pairs[reachable].priority());
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert!(
+        a.nominated_pair.is_none(),
+        "early nomination must not pre-empt a strictly better pair that may still succeed"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlling_early_nomination_respects_acceptance_min_wait() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _unreachable, _reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    a.host_acceptance_min_wait = Duration::from_millis(50);
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert!(
+        a.nominated_pair.is_none(),
+        "early nomination must not bypass the candidate type's acceptance min wait"
+    );
+    Ok(())
+}
