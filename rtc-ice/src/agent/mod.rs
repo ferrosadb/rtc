@@ -1250,6 +1250,134 @@ impl Agent {
         None
     }
 
+    /// Adds the sender of an authenticated request as a peer-reflexive remote candidate and
+    /// returns its index. Adding it pairs it and requests a connectivity check.
+    fn learn_peer_reflexive(
+        &mut self,
+        local_index: usize,
+        remote_addr: SocketAddr,
+    ) -> Result<Option<usize>> {
+        // Use the local candidate's network type for the peer-reflexive candidate
+        let network_type = self.local_candidates[local_index].network_type();
+        let (ip, port) = (remote_addr.ip(), remote_addr.port());
+
+        let prflx_candidate_config = CandidatePeerReflexiveConfig {
+            base_config: CandidateConfig {
+                network: network_type.to_string(),
+                address: ip.to_string(),
+                port,
+                component: self.local_candidates[local_index].component(),
+                ..CandidateConfig::default()
+            },
+            rel_addr: "".to_owned(),
+            rel_port: 0,
+        };
+
+        let prflx_candidate = match prflx_candidate_config.new_candidate_peer_reflexive() {
+            Ok(prflx_candidate) => prflx_candidate,
+            Err(err) => {
+                error!(
+                    "[{}]: Failed to create new remote prflx candidate ({})",
+                    self.get_name(),
+                    err
+                );
+                return Err(err);
+            }
+        };
+        let added = self.add_remote_candidate(prflx_candidate)?;
+        debug!(
+            "[{}]: adding a new peer-reflexive candidate: {} ",
+            self.get_name(),
+            remote_addr
+        );
+        // Look the candidate up by address rather than assuming it is the last element:
+        // `add_remote_candidate` may not have appended it (e.g. a duplicate), and this stays
+        // correct if the vector is ever mutated underneath us. See issue #88.
+        Ok(if added {
+            self.find_remote_candidate(remote_addr)
+        } else {
+            None
+        })
+    }
+
+    /// A request that arrives before the remote credentials (RFC 8445 §7.3: an agent that
+    /// receives a check before its peer's candidates MUST answer it).
+    ///
+    /// Only our half of USERNAME can be checked yet, and MESSAGE-INTEGRITY is keyed by our
+    /// own password, so the request is fully authenticated without anything remote. It is
+    /// answered at once; the sender becomes a peer-reflexive candidate, whose pairing has
+    /// already requested a connectivity check, and `handle_timeout` sends that check the
+    /// moment the remote credentials arrive. Dropping these left the peer's pairs in progress
+    /// until its retransmission.
+    ///
+    /// A success response cannot be checked without the remote password, and we have sent
+    /// no request it could answer, so anything other than a request is still refused.
+    fn handle_inbound_before_remote_credentials(
+        &mut self,
+        now: Instant,
+        m: &mut Message,
+        local_index: usize,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        if m.typ.class != CLASS_REQUEST {
+            debug!(
+                "[{}]: ufrag_pwd.remote_credentials.is_none",
+                self.get_name(),
+            );
+            return Err(Error::ErrPasswordEmpty);
+        }
+        let ours = self.ufrag_pwd.local_credentials.ufrag.clone() + ":";
+        let mut username = Username::new(ATTR_USERNAME, String::new());
+        username.get_from(m)?;
+        if !username.to_string().starts_with(&ours) {
+            warn!(
+                "[{}]: discard early request from ({}), {:?} expected({}…) actual({})",
+                self.get_name(),
+                remote_addr,
+                Error::ErrMismatchUsername,
+                ours,
+                username,
+            );
+            return Err(Error::ErrMismatchUsername);
+        }
+        if let Err(err) = assert_inbound_message_integrity(
+            m,
+            self.ufrag_pwd.local_credentials.pwd.as_bytes(),
+            self.crypto_provider.crypto(),
+        ) {
+            warn!(
+                "[{}]: discard early request from ({}), {}",
+                self.get_name(),
+                remote_addr,
+                err
+            );
+            return Err(err);
+        }
+
+        let remote_index = match self.find_remote_candidate(remote_addr) {
+            Some(index) => index,
+            None => self
+                .learn_peer_reflexive(local_index, remote_addr)?
+                .ok_or(Error::ErrUnhandledStunpacket)?,
+        };
+        if let Some(pair_index) = self.find_pair(local_index, remote_index) {
+            self.candidate_pairs[pair_index].on_request_received();
+            if !self.is_controlling && m.contains(ATTR_USE_CANDIDATE) {
+                // Acted on when this pair's own check succeeds, as for any nomination on an
+                // in-progress pair.
+                self.candidate_pairs[pair_index].nominated = true;
+            }
+        }
+        debug!(
+            "[{}]: answering a check from {} that arrived before the remote credentials",
+            self.get_name(),
+            remote_addr
+        );
+        self.send_binding_success(now, m, local_index, remote_index);
+        self.remote_candidates[remote_index].seen(now, false);
+        Ok(())
+    }
+
     /// Processes STUN traffic from a remote candidate.
     pub(crate) fn handle_inbound(
         &mut self,
@@ -1357,12 +1485,11 @@ impl Agent {
             // Continue processing the message after handling role conflict
         }
 
+        if self.ufrag_pwd.remote_credentials.is_none() {
+            return self.handle_inbound_before_remote_credentials(now, m, local_index, remote_addr);
+        }
         let Some(remote_credentials) = &self.ufrag_pwd.remote_credentials else {
-            debug!(
-                "[{}]: ufrag_pwd.remote_credentials.is_none",
-                self.get_name(),
-            );
-            return Err(Error::ErrPasswordEmpty);
+            unreachable!("remote credentials were checked just above");
         };
 
         let mut remote_candidate_index = self.find_remote_candidate(remote_addr);
@@ -1420,49 +1547,7 @@ impl Agent {
             }
 
             if remote_candidate_index.is_none() {
-                // Use the local candidate's network type for the peer-reflexive candidate
-                let network_type = self.local_candidates[local_index].network_type();
-                let (ip, port) = (remote_addr.ip(), remote_addr.port());
-
-                let prflx_candidate_config = CandidatePeerReflexiveConfig {
-                    base_config: CandidateConfig {
-                        network: network_type.to_string(),
-                        address: ip.to_string(),
-                        port,
-                        component: self.local_candidates[local_index].component(),
-                        ..CandidateConfig::default()
-                    },
-                    rel_addr: "".to_owned(),
-                    rel_port: 0,
-                };
-
-                match prflx_candidate_config.new_candidate_peer_reflexive() {
-                    Ok(prflx_candidate) => {
-                        if let Ok(added) = self.add_remote_candidate(prflx_candidate)
-                            && added
-                        {
-                            // Look the candidate up by address rather than assuming it
-                            // is the last element: `add_remote_candidate` may not have
-                            // appended it (e.g. a duplicate), and this stays correct if
-                            // the vector is ever mutated underneath us. See issue #88.
-                            remote_candidate_index = self.find_remote_candidate(remote_addr);
-                        }
-                    }
-                    Err(err) => {
-                        error!(
-                            "[{}]: Failed to create new remote prflx candidate ({})",
-                            self.get_name(),
-                            err
-                        );
-                        return Err(err);
-                    }
-                };
-
-                debug!(
-                    "[{}]: adding a new peer-reflexive candidate: {} ",
-                    self.get_name(),
-                    remote_addr
-                );
+                remote_candidate_index = self.learn_peer_reflexive(local_index, remote_addr)?;
             }
 
             trace!(

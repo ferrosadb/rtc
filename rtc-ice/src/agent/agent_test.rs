@@ -3386,3 +3386,442 @@ fn test_stats_snapshot_reports_the_callers_instant_throughout() -> Result<()> {
 
     Ok(())
 }
+
+// Early nomination by the controlling agent.
+//
+// Measured on a phone -> VM connect (2026-11-12): the phone's IPv4 host pair succeeded
+// within ~1.4 ms of checking, but nomination waited ~200 ms for the next check tick. The
+// phone also had IPv6 host candidates whose pairs to the VM never succeed; every host/host
+// pair has the same priority, and the unreachable one sorted first. The inbound-request
+// path compared pair INDICES (`best_available == this pair`), so the tie made it refuse,
+// and nothing on the success-response path nominated at all.
+
+const TIED_UNREACHABLE: &str = "10.99.0.1:5000";
+const TIED_REACHABLE: &str = "192.168.64.2:53297";
+
+fn host_candidate(addr: &str, priority: u32) -> Result<Candidate> {
+    let sa = SocketAddr::from_str(addr)?;
+    CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: sa.ip().to_string(),
+            port: sa.port(),
+            component: 1,
+            priority,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()
+}
+
+/// A controlling agent in `Checking` at `t0` with one local host candidate and two remote
+/// host candidates. The first remote (added first, so its pair sorts first) never answers.
+fn controlling_agent_with_two_remote_hosts(
+    t0: Instant,
+    unreachable_priority: u32,
+) -> Result<(Agent, usize, usize)> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.add_remote_candidate(host_candidate(TIED_UNREACHABLE, unreachable_priority)?)?;
+    a.add_remote_candidate(host_candidate(TIED_REACHABLE, 0)?)?;
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remoteufrag".to_string(),
+        pwd: "remotepwdremotepwdremotepwd".to_string(),
+    });
+    a.is_controlling = true;
+    a.start(t0);
+    a.connection_state = ConnectionState::Checking;
+    let unreachable = a.find_pair(0, 0).expect("pair to the unreachable remote");
+    let reachable = a.find_pair(0, 1).expect("pair to the reachable remote");
+    assert!(
+        unreachable < reachable,
+        "the unreachable pair must sort first"
+    );
+    Ok((a, unreachable, reachable))
+}
+
+fn inbound_binding_request() -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
+    Ok(m)
+}
+
+/// Registers an outstanding check to the reachable remote and returns its success response.
+fn outstanding_check_and_its_success(a: &mut Agent, sent: Instant) -> Result<Message> {
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: sent,
+        transaction_id: tid,
+        destination: SocketAddr::from_str(TIED_REACHABLE)?,
+        is_use_candidate: false,
+    });
+    let mut m = Message::new();
+    m.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    Ok(m)
+}
+
+fn sent_use_candidate(a: &Agent) -> bool {
+    a.pending_binding_requests
+        .iter()
+        .any(|r| r.is_use_candidate)
+}
+
+#[test]
+fn test_controlling_nominates_on_request_despite_equal_priority_pair_sorting_first() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    assert_eq!(
+        a.candidate_pairs[unreachable].priority(),
+        a.candidate_pairs[reachable].priority(),
+        "precondition: the two host pairs tie on priority"
+    );
+    a.candidate_pairs[reachable].state = CandidatePairState::Succeeded;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "a succeeded pair tied for the best priority must be nominated without waiting for a tick"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
+
+#[test]
+fn test_controlling_nominates_when_success_arrives_after_peer_request() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    // The peer's own check arrives first, while our check is still in flight.
+    a.handle_binding_request(
+        t0 + Duration::from_millis(1),
+        &inbound_binding_request()?,
+        0,
+        1,
+    );
+    assert!(
+        a.nominated_pair.is_none(),
+        "an in-progress pair cannot be nominated"
+    );
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "the success that makes the best pair valid must nominate it without waiting for a tick"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
+
+#[test]
+fn test_controlling_waits_while_a_strictly_better_pair_is_still_checking() -> Result<()> {
+    let t0 = Instant::now();
+    // The pair that has not answered yet is strictly better than the one that did.
+    let (mut a, unreachable, reachable) =
+        controlling_agent_with_two_remote_hosts(t0, u32::MAX / 2)?;
+    assert!(a.candidate_pairs[unreachable].priority() > a.candidate_pairs[reachable].priority());
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert!(
+        a.nominated_pair.is_none(),
+        "early nomination must not pre-empt a strictly better pair that may still succeed"
+    );
+    Ok(())
+}
+
+// The controlled side of the same race (2026-11-12, after early nomination landed): the
+// phone nominated 1.4 ms into checking, before the VM's own check on the pair had come back.
+// The VM sent a triggered check but no response to the USE-CANDIDATE request and kept no
+// record of the nomination, so the phone's next nomination, a 200 ms tick later, was the
+// one that connected. RFC 8445 §7.3.1.5: an in-progress pair's nominated flag is set when
+// its triggered check succeeds; §7.3: an authenticated request is answered.
+
+/// A controlled agent in `Checking` at `t0` with one host pair, still in progress.
+fn controlled_agent_with_one_pair(t0: Instant) -> Result<(Agent, usize)> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.64.2:53297", 0)?)?;
+    a.add_remote_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remoteufrag".to_string(),
+        pwd: "remotepwdremotepwdremotepwd".to_string(),
+    });
+    a.is_controlling = false;
+    a.start(t0);
+    a.connection_state = ConnectionState::Checking;
+    let pair = a.find_pair(0, 0).expect("the host pair");
+    Ok((a, pair))
+}
+
+fn inbound_nomination() -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(UseCandidateAttr::new()),
+    ])?;
+    Ok(m)
+}
+
+/// Whether a binding success response for `tid` was written.
+fn answered(a: &Agent, tid: TransactionId) -> bool {
+    a.write_outs.iter().any(|out| {
+        let mut m = Message::new();
+        m.raw = out.message.to_vec();
+        m.decode().is_ok() && m.typ == BINDING_SUCCESS && m.transaction_id == tid
+    })
+}
+
+#[test]
+fn test_controlled_answers_nomination_on_in_progress_pair() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, pair) = controlled_agent_with_one_pair(t0)?;
+    let nomination = inbound_nomination()?;
+
+    a.handle_binding_request(t0 + Duration::from_millis(1), &nomination, 0, 0);
+
+    assert!(
+        answered(&a, nomination.transaction_id),
+        "an authenticated USE-CANDIDATE request must be answered even before our check succeeds"
+    );
+    assert!(
+        a.candidate_pairs[pair].nominated,
+        "the nomination must be remembered"
+    );
+    assert!(
+        a.selected_pair.is_none(),
+        "an in-progress pair is not selected yet"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlled_selects_nominated_pair_when_its_check_succeeds() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, pair) = controlled_agent_with_one_pair(t0)?;
+    let remote = SocketAddr::from_str("192.168.14.154:65143")?;
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: t0,
+        transaction_id: tid,
+        destination: remote,
+        is_use_candidate: false,
+    });
+
+    // The nomination overtakes the response to our own check.
+    a.handle_binding_request(t0 + Duration::from_millis(1), &inbound_nomination()?, 0, 0);
+    let mut success = Message::new();
+    success.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    a.handle_success_response(t0 + Duration::from_millis(2), &success, 0, 0, remote);
+
+    assert_eq!(
+        a.selected_pair,
+        Some(pair),
+        "a nominated pair is selected when its check succeeds, without a second nomination"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlled_does_not_select_unnominated_pair_on_success() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _pair) = controlled_agent_with_one_pair(t0)?;
+    let remote = SocketAddr::from_str("192.168.14.154:65143")?;
+    let tid = TransactionId::new();
+    a.pending_binding_requests.push(BindingRequest {
+        timestamp: t0,
+        transaction_id: tid,
+        destination: remote,
+        is_use_candidate: false,
+    });
+    let mut success = Message::new();
+    success.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    a.handle_success_response(t0 + Duration::from_millis(2), &success, 0, 0, remote);
+
+    assert!(
+        a.selected_pair.is_none(),
+        "the controlled agent selects only what the controlling agent nominated"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlling_early_nomination_respects_acceptance_min_wait() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _unreachable, _reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    a.host_acceptance_min_wait = Duration::from_millis(50);
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    a.handle_binding_request(now, &inbound_binding_request()?, 0, 1);
+
+    assert!(
+        a.nominated_pair.is_none(),
+        "early nomination must not bypass the candidate type's acceptance min wait"
+    );
+    Ok(())
+}
+
+// The acceptance min wait was enforced by the 200 ms check tick: a best pair that succeeded
+// inside its wait was nominated on the first tick after the wait ended, so a 250 ms srflx wait
+// cost up to 400 ms. The wait's end is a known instant, so the agent asks to be woken then.
+
+/// A controlling agent whose best pair succeeded 2 ms in, inside a 50 ms host min wait, with
+/// the forced contact that adding candidates requested already run.
+fn controlling_agent_deferred_by_min_wait(t0: Instant) -> Result<(Agent, usize)> {
+    let (mut a, _unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    a.host_acceptance_min_wait = Duration::from_millis(50);
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    sansio::Protocol::handle_timeout(&mut a, now)?;
+    assert!(
+        a.nominated_pair.is_none(),
+        "precondition: deferred by the min wait"
+    );
+    Ok((a, reachable))
+}
+
+#[test]
+fn test_controlling_asks_to_wake_when_the_min_wait_ends() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _reachable) = controlling_agent_deferred_by_min_wait(t0)?;
+    assert_eq!(
+        sansio::Protocol::poll_timeout(&mut a),
+        Some(t0 + Duration::from_millis(50)),
+        "the agent must ask to be woken when the best pair's acceptance wait ends, not a tick later"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlling_nominates_the_moment_the_min_wait_ends() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, reachable) = controlling_agent_deferred_by_min_wait(t0)?;
+    sansio::Protocol::handle_timeout(&mut a, t0 + Duration::from_millis(50))?;
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "a best pair that has waited out its acceptance wait must be nominated at once"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
+
+// A check that arrives before the remote credentials (2026-11-12, phone -> VM): the VM
+// answered the phone's offer and began checking ~47 ms before the phone had applied the
+// answer. The phone dropped every one of those checks ("password is empty"), so the VM's
+// pairs stayed in progress until its retransmission. RFC 8445 §7.3: an agent that receives a
+// check before its peer's candidates MUST answer it; the request is authenticated with the
+// LOCAL password and only the local half of USERNAME, so nothing remote is needed.
+
+const EARLY_PEER: &str = "192.168.64.2:53297";
+
+/// A controlling agent with one local host candidate and no remote credentials yet.
+fn agent_awaiting_remote_credentials(t0: Instant) -> Result<Agent> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.is_controlling = true;
+    a.start(t0);
+    Ok(a)
+}
+
+/// A binding request from the controlled peer whose USERNAME names `local_ufrag` as ours.
+fn early_check(a: &Agent, local_ufrag: &str) -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(
+            ATTR_USERNAME,
+            format!("{local_ufrag}:peerufrag"),
+        )),
+        Box::new(crate::attributes::control::AttrControlled(1)),
+        Box::new(PriorityAttr(1)),
+        Box::new(MessageIntegrity::new_short_term_integrity_with_provider(
+            a.ufrag_pwd.local_credentials.pwd.clone(),
+            test_crypto_provider().crypto(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+    Ok(m)
+}
+
+#[test]
+fn test_check_before_remote_credentials_is_answered() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let local_ufrag = a.ufrag_pwd.local_credentials.ufrag.clone();
+    let mut check = early_check(&a, &local_ufrag)?;
+    let tid = check.transaction_id;
+
+    a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)?;
+
+    assert!(
+        answered(&a, tid),
+        "an authenticated check must be answered even before the remote credentials arrive"
+    );
+    assert!(
+        a.find_remote_candidate(SocketAddr::from_str(EARLY_PEER)?)
+            .is_some(),
+        "the sender is learned as a peer-reflexive candidate, ready for the triggered check"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_check_before_remote_credentials_is_checked_back_when_they_arrive() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let local_ufrag = a.ufrag_pwd.local_credentials.ufrag.clone();
+    let mut check = early_check(&a, &local_ufrag)?;
+    a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)?;
+
+    let later = t0 + Duration::from_millis(47);
+    a.set_remote_credentials("peerufrag".into(), "peerpwdpeerpwdpeerpwdpeer".into())?;
+    assert_eq!(
+        sansio::Protocol::poll_timeout(&mut a),
+        Some(a.last_checking_time),
+        "the credentials arriving must make the triggered check due at once"
+    );
+    sansio::Protocol::handle_timeout(&mut a, later)?;
+    let peer = SocketAddr::from_str(EARLY_PEER)?;
+    assert!(
+        a.pending_binding_requests
+            .iter()
+            .any(|r| r.destination == peer),
+        "the early sender must be checked back as soon as the credentials arrive"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_check_for_another_ufrag_before_remote_credentials_is_refused() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let mut check = early_check(&a, "notours")?;
+    let tid = check.transaction_id;
+
+    assert!(
+        a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)
+            .is_err(),
+        "a check naming another agent's ufrag must be refused"
+    );
+    assert!(!answered(&a, tid), "a refused check must not be answered");
+    assert!(
+        a.remote_candidates.is_empty(),
+        "a refused check must not create a candidate"
+    );
+    Ok(())
+}

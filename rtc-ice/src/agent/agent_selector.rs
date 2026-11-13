@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use log::{debug, error, trace, warn};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use stun::attributes::*;
 use stun::fingerprint::*;
 use stun::integrity::*;
@@ -58,26 +58,106 @@ impl Agent {
     ///
     /// `now` is supplied by the caller rather than sampled here so that one nomination decision
     /// makes one time observation: both halves of a pair are tested against the same instant.
-    fn is_nominatable(&self, now: Instant, index: usize, is_local: bool) -> bool {
+    /// How long a candidate of this type must wait after `start_time` before a pair using it
+    /// may be nominated. `None` for a candidate of no known type, which is never nominatable.
+    fn acceptance_min_wait(&self, index: usize, is_local: bool) -> Option<Duration> {
         let c = if is_local {
             &self.local_candidates[index]
         } else {
             &self.remote_candidates[index]
         };
-        let min_wait = match c.candidate_type() {
-            CandidateType::Host => self.host_acceptance_min_wait,
-            CandidateType::ServerReflexive => self.srflx_acceptance_min_wait,
-            CandidateType::PeerReflexive => self.prflx_acceptance_min_wait,
-            CandidateType::Relay => self.relay_acceptance_min_wait,
+        match c.candidate_type() {
+            CandidateType::Host => Some(self.host_acceptance_min_wait),
+            CandidateType::ServerReflexive => Some(self.srflx_acceptance_min_wait),
+            CandidateType::PeerReflexive => Some(self.prflx_acceptance_min_wait),
+            CandidateType::Relay => Some(self.relay_acceptance_min_wait),
             CandidateType::Unspecified => {
                 error!(
                     "is_nominatable invalid candidate type {}",
                     c.candidate_type()
                 );
-                return false;
+                None
             }
+        }
+    }
+
+    fn is_nominatable(&self, now: Instant, index: usize, is_local: bool) -> bool {
+        // `>=`, so the instant `nomination_due_at` asks to be woken at is itself nominatable.
+        self.acceptance_min_wait(index, is_local)
+            .is_some_and(|min_wait| now.saturating_duration_since(self.start_time) >= min_wait)
+    }
+
+    /// When the controlling agent's best valid pair becomes nominatable, if it is waiting on
+    /// its acceptance min wait. The agent asks to be woken then rather than on the next check
+    /// tick, so the wait costs exactly itself. `None` when there is nothing to nominate.
+    pub(crate) fn nomination_due_at(&self) -> Option<Instant> {
+        if !self.is_controlling
+            || self.nominated_pair.is_some()
+            || self.get_selected_pair().is_some()
+        {
+            return None;
+        }
+        let pair = self.candidate_pairs[self.get_best_valid_candidate_pair()?];
+        let local = self.acceptance_min_wait(pair.local_index, true)?;
+        let remote = self.acceptance_min_wait(pair.remote_index, false)?;
+        Some(self.start_time + local.max(remote))
+    }
+
+    /// The highest priority among pairs that have not failed, i.e. the best any pending check
+    /// could still produce.
+    fn best_available_priority(&self) -> Option<u64> {
+        self.candidate_pairs
+            .iter()
+            .filter(|p| p.state != CandidatePairState::Failed)
+            .map(|p| p.priority())
+            .max()
+    }
+
+    /// Controlling agent only: nominates `pair_index` at once, instead of on the next check
+    /// tick, when no later tick could make a better choice.
+    ///
+    /// That holds when the pair has succeeded, no pair that has not failed has a strictly
+    /// higher priority, and both candidates have waited out their type's acceptance min wait.
+    /// Priority is compared, not pair index: equal-priority pairs (every host/host pair) are
+    /// interchangeable, and comparing indices let an unreachable pair that sorted first block
+    /// nomination until the tick. Returns whether it nominated.
+    fn nominate_early_if_best(&mut self, now: Instant, pair_index: usize) -> bool {
+        debug_assert!(self.is_controlling, "only the controlling agent nominates");
+        if self.nominated_pair.is_some() || self.get_selected_pair().is_some() {
+            return false;
+        }
+        let p = self.candidate_pairs[pair_index];
+        if p.state != CandidatePairState::Succeeded {
+            return false;
+        }
+        let Some(best) = self.best_available_priority() else {
+            error!("nominate_early_if_best: a succeeded pair exists but no pair is available");
+            return false;
         };
-        now.saturating_duration_since(self.start_time) > min_wait
+        if p.priority() < best {
+            trace!(
+                "controllingSelector: {} succeeded but a better pair (priority {}) is still checking",
+                p, best
+            );
+            return false;
+        }
+        if !(self.is_nominatable(now, p.local_index, true)
+            && self.is_nominatable(now, p.remote_index, false))
+        {
+            trace!(
+                "controllingSelector: {} is best but inside its acceptance min wait",
+                p
+            );
+            return false;
+        }
+        trace!(
+            "The candidate ({}, {}) is the best candidate available, marking it as nominated",
+            p.local_index, p.remote_index
+        );
+        self.candidate_pairs[pair_index].nominated = true;
+        self.nominated_pair = Some(pair_index);
+        self.nominate_pair(now);
+        true
     }
 
     fn nominate_pair(&mut self, now: Instant) {
@@ -337,6 +417,10 @@ impl ControllingSelector for Agent {
                 );
                 if pending_request.is_use_candidate && selected_pair_is_none {
                     self.set_selected_pair(Some(now), Some(pair_index));
+                } else {
+                    // This success may be what makes the best pair valid; the peer's own
+                    // check can arrive before it, so the request path alone can miss it.
+                    self.nominate_early_if_best(now, pair_index);
                 }
             } else {
                 // This shouldn't happen
@@ -365,39 +449,13 @@ impl ControllingSelector for Agent {
             self.candidate_pairs[pair_index].on_request_received();
 
             let p = &self.candidate_pairs[pair_index];
-            let nominated_pair_is_none = self.nominated_pair.is_none();
-
             trace!(
                 "controllingSelector: after findPair {}, p.state: {}, {}",
                 p,
                 p.state,
-                nominated_pair_is_none,
-                //self.get_selected_pair().await.is_none() //, {}
+                self.nominated_pair.is_none(),
             );
-            if p.state == CandidatePairState::Succeeded
-                && nominated_pair_is_none
-                && self.get_selected_pair().is_none()
-            {
-                if let Some(best_pair_index) = self.get_best_available_pair() {
-                    trace!(
-                        "controllingSelector: getBestAvailableCandidatePair {}",
-                        best_pair_index
-                    );
-                    if best_pair_index == pair_index
-                        && self.is_nominatable(now, p.local_index, true)
-                        && self.is_nominatable(now, p.remote_index, false)
-                    {
-                        trace!(
-                            "The candidate ({}, {}) is the best candidate available, marking it as nominated",
-                            p.local_index, p.remote_index
-                        );
-                        self.nominated_pair = Some(pair_index);
-                        self.nominate_pair(now);
-                    }
-                } else {
-                    trace!("No best pair available");
-                }
-            }
+            self.nominate_early_if_best(now, pair_index);
         } else {
             trace!("controllingSelector: addPair");
             self.add_pair(local_index, remote_index);
@@ -505,6 +563,12 @@ impl ControlledSelector for Agent {
                     self.remote_candidates[p.remote_index].addr(),
                     rtt.as_millis()
                 );
+
+                // RFC 8445 §7.3.1.5: a pair nominated while its check was in progress
+                // becomes the selected pair when that check succeeds.
+                if p.nominated && self.get_selected_pair().is_none() {
+                    self.set_selected_pair(Some(now), Some(pair_index));
+                }
             } else {
                 // This shouldn't happen
                 error!("Success response from invalid candidate pair");
@@ -555,6 +619,17 @@ impl ControlledSelector for Agent {
                     // MUST remove the candidate pair from the valid list, set the
                     // candidate pair state to Failed, and set the checklist state to
                     // Failed.
+                    //
+                    // The flag is recorded now and acted on in `handle_success_response`.
+                    // The request itself passed authentication, so it is answered
+                    // (Section 7.3): leaving it unanswered made the controlling agent
+                    // repeat the nomination on its next check tick, ~200 ms later.
+                    self.candidate_pairs[pair_index].nominated = true;
+                    trace!(
+                        "controlledSelector: nomination on in-progress pair {}, selecting when its check succeeds",
+                        self.candidate_pairs[pair_index]
+                    );
+                    self.send_binding_success(now, m, local_index, remote_index);
                     self.ping_candidate(now, local_index, remote_index);
                 }
             } else {
