@@ -1,7 +1,7 @@
 use crate::agent::Agent;
 use log::{debug, error, trace, warn};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use stun::attributes::*;
 use stun::fingerprint::*;
 use stun::integrity::*;
@@ -58,26 +58,49 @@ impl Agent {
     ///
     /// `now` is supplied by the caller rather than sampled here so that one nomination decision
     /// makes one time observation: both halves of a pair are tested against the same instant.
-    fn is_nominatable(&self, now: Instant, index: usize, is_local: bool) -> bool {
+    /// How long a candidate of this type must wait after `start_time` before a pair using it
+    /// may be nominated. `None` for a candidate of no known type, which is never nominatable.
+    fn acceptance_min_wait(&self, index: usize, is_local: bool) -> Option<Duration> {
         let c = if is_local {
             &self.local_candidates[index]
         } else {
             &self.remote_candidates[index]
         };
-        let min_wait = match c.candidate_type() {
-            CandidateType::Host => self.host_acceptance_min_wait,
-            CandidateType::ServerReflexive => self.srflx_acceptance_min_wait,
-            CandidateType::PeerReflexive => self.prflx_acceptance_min_wait,
-            CandidateType::Relay => self.relay_acceptance_min_wait,
+        match c.candidate_type() {
+            CandidateType::Host => Some(self.host_acceptance_min_wait),
+            CandidateType::ServerReflexive => Some(self.srflx_acceptance_min_wait),
+            CandidateType::PeerReflexive => Some(self.prflx_acceptance_min_wait),
+            CandidateType::Relay => Some(self.relay_acceptance_min_wait),
             CandidateType::Unspecified => {
                 error!(
                     "is_nominatable invalid candidate type {}",
                     c.candidate_type()
                 );
-                return false;
+                None
             }
-        };
-        now.saturating_duration_since(self.start_time) > min_wait
+        }
+    }
+
+    fn is_nominatable(&self, now: Instant, index: usize, is_local: bool) -> bool {
+        // `>=`, so the instant `nomination_due_at` asks to be woken at is itself nominatable.
+        self.acceptance_min_wait(index, is_local)
+            .is_some_and(|min_wait| now.saturating_duration_since(self.start_time) >= min_wait)
+    }
+
+    /// When the controlling agent's best valid pair becomes nominatable, if it is waiting on
+    /// its acceptance min wait. The agent asks to be woken then rather than on the next check
+    /// tick, so the wait costs exactly itself. `None` when there is nothing to nominate.
+    pub(crate) fn nomination_due_at(&self) -> Option<Instant> {
+        if !self.is_controlling
+            || self.nominated_pair.is_some()
+            || self.get_selected_pair().is_some()
+        {
+            return None;
+        }
+        let pair = self.candidate_pairs[self.get_best_valid_candidate_pair()?];
+        let local = self.acceptance_min_wait(pair.local_index, true)?;
+        let remote = self.acceptance_min_wait(pair.remote_index, false)?;
+        Some(self.start_time + local.max(remote))
     }
 
     /// The highest priority among pairs that have not failed, i.e. the best any pending check

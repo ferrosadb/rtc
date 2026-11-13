@@ -123,8 +123,10 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         };
         self.trigger_request_connectivity_check(remote_candidates);
 
+        let nomination_due = self.nomination_due_at().is_some_and(|due| due <= now);
         if self.ufrag_pwd.remote_credentials.is_some()
             && (self.force_candidate_contact
+                || nomination_due
                 || self.last_checking_time + self.get_timeout_interval() <= now)
         {
             self.contact(now);
@@ -150,7 +152,10 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
                 // past, so the resulting deadline is immediate.
                 Some(self.last_checking_time)
             } else {
-                Some(self.last_checking_time + self.get_timeout_interval())
+                let tick = self.last_checking_time + self.get_timeout_interval();
+                // A best pair waiting out its acceptance min wait is nominated the moment the
+                // wait ends, not on the first tick after it.
+                Some(self.nomination_due_at().map_or(tick, |due| due.min(tick)))
             }
         } else {
             None

@@ -3672,3 +3672,49 @@ fn test_controlling_early_nomination_respects_acceptance_min_wait() -> Result<()
     );
     Ok(())
 }
+
+// The acceptance min wait was enforced by the 200 ms check tick: a best pair that succeeded
+// inside its wait was nominated on the first tick after the wait ended, so a 250 ms srflx wait
+// cost up to 400 ms. The wait's end is a known instant, so the agent asks to be woken then.
+
+/// A controlling agent whose best pair succeeded 2 ms in, inside a 50 ms host min wait, with
+/// the forced contact that adding candidates requested already run.
+fn controlling_agent_deferred_by_min_wait(t0: Instant) -> Result<(Agent, usize)> {
+    let (mut a, _unreachable, reachable) = controlling_agent_with_two_remote_hosts(t0, 0)?;
+    a.host_acceptance_min_wait = Duration::from_millis(50);
+    let success = outstanding_check_and_its_success(&mut a, t0)?;
+    let now = t0 + Duration::from_millis(2);
+    a.handle_success_response(now, &success, 0, 1, SocketAddr::from_str(TIED_REACHABLE)?);
+    sansio::Protocol::handle_timeout(&mut a, now)?;
+    assert!(
+        a.nominated_pair.is_none(),
+        "precondition: deferred by the min wait"
+    );
+    Ok((a, reachable))
+}
+
+#[test]
+fn test_controlling_asks_to_wake_when_the_min_wait_ends() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, _reachable) = controlling_agent_deferred_by_min_wait(t0)?;
+    assert_eq!(
+        sansio::Protocol::poll_timeout(&mut a),
+        Some(t0 + Duration::from_millis(50)),
+        "the agent must ask to be woken when the best pair's acceptance wait ends, not a tick later"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_controlling_nominates_the_moment_the_min_wait_ends() -> Result<()> {
+    let t0 = Instant::now();
+    let (mut a, reachable) = controlling_agent_deferred_by_min_wait(t0)?;
+    sansio::Protocol::handle_timeout(&mut a, t0 + Duration::from_millis(50))?;
+    assert_eq!(
+        a.nominated_pair,
+        Some(reachable),
+        "a best pair that has waited out its acceptance wait must be nominated at once"
+    );
+    assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
+    Ok(())
+}
