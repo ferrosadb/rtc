@@ -3718,3 +3718,110 @@ fn test_controlling_nominates_the_moment_the_min_wait_ends() -> Result<()> {
     assert!(sent_use_candidate(&a), "nomination must send USE-CANDIDATE");
     Ok(())
 }
+
+// A check that arrives before the remote credentials (2026-11-12, phone -> VM): the VM
+// answered the phone's offer and began checking ~47 ms before the phone had applied the
+// answer. The phone dropped every one of those checks ("password is empty"), so the VM's
+// pairs stayed in progress until its retransmission. RFC 8445 §7.3: an agent that receives a
+// check before its peer's candidates MUST answer it; the request is authenticated with the
+// LOCAL password and only the local half of USERNAME, so nothing remote is needed.
+
+const EARLY_PEER: &str = "192.168.64.2:53297";
+
+/// A controlling agent with one local host candidate and no remote credentials yet.
+fn agent_awaiting_remote_credentials(t0: Instant) -> Result<Agent> {
+    let mut a = Agent::new(t0, Arc::new(AgentConfig::default()), test_crypto_provider())?;
+    a.add_local_candidate(host_candidate("192.168.14.154:65143", 0)?)?;
+    a.is_controlling = true;
+    a.start(t0);
+    Ok(a)
+}
+
+/// A binding request from the controlled peer whose USERNAME names `local_ufrag` as ours.
+fn early_check(a: &Agent, local_ufrag: &str) -> Result<Message> {
+    let mut m = Message::new();
+    m.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(
+            ATTR_USERNAME,
+            format!("{local_ufrag}:peerufrag"),
+        )),
+        Box::new(crate::attributes::control::AttrControlled(1)),
+        Box::new(PriorityAttr(1)),
+        Box::new(MessageIntegrity::new_short_term_integrity_with_provider(
+            a.ufrag_pwd.local_credentials.pwd.clone(),
+            test_crypto_provider().crypto(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+    Ok(m)
+}
+
+#[test]
+fn test_check_before_remote_credentials_is_answered() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let local_ufrag = a.ufrag_pwd.local_credentials.ufrag.clone();
+    let mut check = early_check(&a, &local_ufrag)?;
+    let tid = check.transaction_id;
+
+    a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)?;
+
+    assert!(
+        answered(&a, tid),
+        "an authenticated check must be answered even before the remote credentials arrive"
+    );
+    assert!(
+        a.find_remote_candidate(SocketAddr::from_str(EARLY_PEER)?)
+            .is_some(),
+        "the sender is learned as a peer-reflexive candidate, ready for the triggered check"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_check_before_remote_credentials_is_checked_back_when_they_arrive() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let local_ufrag = a.ufrag_pwd.local_credentials.ufrag.clone();
+    let mut check = early_check(&a, &local_ufrag)?;
+    a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)?;
+
+    let later = t0 + Duration::from_millis(47);
+    a.set_remote_credentials("peerufrag".into(), "peerpwdpeerpwdpeerpwdpeer".into())?;
+    assert_eq!(
+        sansio::Protocol::poll_timeout(&mut a),
+        Some(a.last_checking_time),
+        "the credentials arriving must make the triggered check due at once"
+    );
+    sansio::Protocol::handle_timeout(&mut a, later)?;
+    let peer = SocketAddr::from_str(EARLY_PEER)?;
+    assert!(
+        a.pending_binding_requests
+            .iter()
+            .any(|r| r.destination == peer),
+        "the early sender must be checked back as soon as the credentials arrive"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_check_for_another_ufrag_before_remote_credentials_is_refused() -> Result<()> {
+    let t0 = Instant::now();
+    let mut a = agent_awaiting_remote_credentials(t0)?;
+    let mut check = early_check(&a, "notours")?;
+    let tid = check.transaction_id;
+
+    assert!(
+        a.handle_inbound(t0, &mut check, 0, SocketAddr::from_str(EARLY_PEER)?)
+            .is_err(),
+        "a check naming another agent's ufrag must be refused"
+    );
+    assert!(!answered(&a, tid), "a refused check must not be answered");
+    assert!(
+        a.remote_candidates.is_empty(),
+        "a refused check must not create a candidate"
+    );
+    Ok(())
+}
