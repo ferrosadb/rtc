@@ -573,7 +573,7 @@ impl Association {
             if timer == Timer::Ack {
                 self.on_ack_timeout();
             } else if failure {
-                self.on_retransmission_failure(timer);
+                self.on_retransmission_failure(timer, n_rtos);
             } else {
                 self.on_retransmission_timeout(timer, n_rtos, now);
                 if self.state() == AssociationState::Closed {
@@ -1794,15 +1794,26 @@ impl Association {
             self.reset_streams_if_any(p, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
+            if p.result == ReconfigResult::InProgress {
+                // Not an answer: the peer performs the request later and sends the final
+                // result then. That one response may be lost, so the request stays on the
+                // retransmission timer until a final result arrives (RFC 6525 §5.1.1); the peer
+                // answers a retransmission with its current result. Hearing from the peer at all
+                // shows it is alive, so the retry budget starts over: a peer whose application
+                // is slow to drain is not a dead peer. The backoff interval is kept.
+                if self
+                    .reconfigs
+                    .contains_key(&p.reconfig_response_sequence_number)
+                {
+                    self.timers.reset_retrans(Timer::Reconfig);
+                }
+                return Ok(());
+            }
             self.reconfigs.remove(&p.reconfig_response_sequence_number);
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
             }
-            // "In progress" is not an answer: the peer performs the request later and then
-            // sends the final result for the same sequence number.
-            if p.result != ReconfigResult::InProgress {
-                self.on_outgoing_reset_answered(p.reconfig_response_sequence_number, p.result);
-            }
+            self.on_outgoing_reset_answered(p.reconfig_response_sequence_number, p.result);
             Ok(())
         } else {
             Err(Error::ErrParameterType)
@@ -2524,6 +2535,15 @@ impl Association {
                 self.timers
                     .start(Timer::Reconfig, now, self.rto_mgr.get_rto());
             }
+        }
+
+        // Every request awaiting an answer must be on the retransmission timer. Requests sent
+        // from the receive path — the reset answering a peer's reset — are queued as control
+        // packets and never pass through the block above, so without this a lost one would
+        // never be sent again and its id never released.
+        if !self.reconfigs.is_empty() {
+            self.timers
+                .start_if_idle(Timer::Reconfig, now, self.rto_mgr.get_rto());
         }
 
         raw_packets
@@ -3607,7 +3627,7 @@ impl Association {
         }
     }
 
-    fn on_retransmission_failure(&mut self, id: Timer) {
+    fn on_retransmission_failure(&mut self, id: Timer, n_rtos: usize) {
         match id {
             Timer::T1Init => {
                 error!("[{}] retransmission failure: T1-init", self.side);
@@ -3635,8 +3655,42 @@ impl Association {
                 error!("[{}] retransmission failure: T3-rtx (DATA)", self.side);
             }
 
-            _ => {}
+            Timer::Reconfig => self.abandon_reset_requests(n_rtos),
+
+            // The ACK timer never fails: `handle_timeout` handles it before the failure check.
+            Timer::Ack => {}
         }
+    }
+
+    /// Gives up on every unanswered reset request after `n_rtos` expiries of the RE-CONFIG
+    /// timer without a reply.
+    ///
+    /// The requests stop being retransmitted, but the ids they name stay reserved: the peer may
+    /// still have performed them, and its own reset of the same ids could arrive later and tear
+    /// down whatever reused one. An id is released by a late final answer (which is still
+    /// honoured) or when the association closes. The timer is stopped, which also clears its
+    /// retry count and backoff, so a reset started later gets a full budget of its own.
+    fn abandon_reset_requests(&mut self, n_rtos: usize) {
+        let mut streams: Vec<StreamId> = self
+            .reconfigs
+            .values()
+            .filter_map(|c| c.param_a.as_ref())
+            .filter_map(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            .flat_map(|p| p.stream_identifiers.iter().copied())
+            .collect();
+        streams.sort_unstable();
+        streams.dedup();
+        let mut requests: Vec<u32> = self.reconfigs.keys().copied().collect();
+        requests.sort_unstable();
+        error!(
+            "[{}] retransmission failure: RE-CONFIG; peer never answered stream reset \
+             request(s) {:?} for stream(s) {:?} after {} timer expiries; giving up, ids stay \
+             reserved until a late answer or the association closes",
+            self.side, requests, streams, n_rtos
+        );
+        self.reconfigs.clear();
+        self.will_retransmit_reconfig = false;
+        self.timers.stop(Timer::Reconfig);
     }
 
     /// Whether no timers are running
