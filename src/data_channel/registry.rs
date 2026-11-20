@@ -4,7 +4,7 @@ use crate::peer_connection::transport::dtls::role::RTCDtlsRole;
 use crate::peer_connection::transport::sctp::SCTP_MAX_CHANNELS;
 use sctp::StreamId;
 use shared::error::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Every data channel on a peer connection, indexed by both of its identifiers.
 ///
@@ -30,6 +30,13 @@ pub(crate) struct DataChannelRegistry {
     /// peer), so a generated id cannot collide with one the peer opened first.
     by_stream: HashMap<StreamId, RTCDataChannelId>,
 
+    /// Stream ids whose channel has closed but whose SCTP stream reset has not yet completed in
+    /// both directions. They count as taken: RFC 8832 §6 allows a new channel only on an id
+    /// "for which the corresponding incoming and outgoing streams are unused", and a channel
+    /// placed on one of these would be torn down when the old reset completes. Bounded by the
+    /// stream-id space.
+    resetting: HashSet<StreamId>,
+
     /// Monotonic handle counter. Never decremented, never reused.
     next_handle: RTCDataChannelId,
 }
@@ -39,6 +46,7 @@ impl DataChannelRegistry {
         Self {
             channels: HashMap::new(),
             by_stream: HashMap::new(),
+            resetting: HashSet::new(),
             next_handle: 0,
         }
     }
@@ -48,7 +56,7 @@ impl DataChannelRegistry {
     ///
     /// Handles are issued monotonically and never reused, so a handle an application is still
     /// holding can never come to name a different channel after the original closed. (The
-    /// stream id it occupied does become available again, as before.) `usize` is what makes
+    /// stream id it occupied does become available again, once its reset completes.) `usize` is what makes
     /// this affordable: exhausting the handle space is not a practical concern, so unlike
     /// stream-id allocation this cannot fail.
     ///
@@ -101,18 +109,31 @@ impl DataChannelRegistry {
         self.channels.get_mut(&handle)
     }
 
-    /// Removes the channel occupying `stream_id`, freeing that id for reuse.
+    /// Removes the channel occupying `stream_id`.
+    ///
+    /// The id is *not* free yet: it stays reserved until [`Self::release_stream_id`], which the
+    /// SCTP layer triggers once the stream's reset has completed in both directions.
     pub(crate) fn remove_by_stream(
         &mut self,
         stream_id: &StreamId,
     ) -> Option<RTCDataChannelInternal> {
         let handle = self.by_stream.remove(stream_id)?;
+        self.resetting.insert(*stream_id);
         self.channels.remove(&handle)
     }
 
-    /// Whether `stream_id` is already claimed, by a channel of any origin.
+    /// Makes `stream_id` available to new channels again: its reset has completed, or the
+    /// association is gone.
+    ///
+    /// Leaves a channel the peer has since opened on the id alone; only the reservation goes.
+    pub(crate) fn release_stream_id(&mut self, stream_id: &StreamId) {
+        self.resetting.remove(stream_id);
+    }
+
+    /// Whether `stream_id` is already claimed, by a channel of any origin, or still held by
+    /// the unfinished reset of a closed one.
     pub(crate) fn stream_id_in_use(&self, stream_id: &StreamId) -> bool {
-        self.by_stream.contains_key(stream_id)
+        self.by_stream.contains_key(stream_id) || self.resetting.contains(stream_id)
     }
 
     /// Handles of channels still awaiting a stream id, in creation order.
@@ -215,9 +236,11 @@ impl DataChannelRegistry {
         self.channels.values_mut()
     }
 
-    /// Removes every channel, in handle order, freeing all stream ids.
+    /// Removes every channel, in handle order, freeing all stream ids. Only for when the
+    /// transport is gone, so there is no reset left to wait for.
     pub(crate) fn drain(&mut self) -> Vec<RTCDataChannelInternal> {
         self.by_stream.clear();
+        self.resetting.clear();
         let mut channels: Vec<_> = self.channels.drain().map(|(_, channel)| channel).collect();
         channels.sort_by_key(|channel| channel.id);
         channels

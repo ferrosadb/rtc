@@ -123,6 +123,37 @@ pub enum Event {
     DatagramReceived,
 }
 
+/// How many performed peer reset requests are remembered for retransmission detection. A peer
+/// retransmits only requests still awaiting our response, and it numbers them sequentially, so
+/// this only has to cover the requests that can be outstanding at once.
+const PERFORMED_RESET_REQUESTS_KEPT: usize = 64;
+
+/// Progress of one stream id's reset (RFC 6525) through both directions.
+///
+/// Closing a data channel resets our outgoing stream; RFC 8831 §6.7 has the peer answer by
+/// resetting its own. A peer-initiated close runs the same two halves in the other order. The
+/// id is reusable only when both are done.
+#[derive(Debug, Default)]
+struct StreamReset {
+    /// Our reset request is queued behind the stream's remaining data and not yet sent.
+    outgoing_queued: bool,
+    /// Sequence numbers of our reset requests naming this id that the peer has not yet
+    /// answered with a final result.
+    outgoing_requests: Vec<u32>,
+    /// We are still waiting for the peer to reset its outgoing stream with this id.
+    awaiting_incoming: bool,
+}
+
+impl StreamReset {
+    fn outgoing_started(&self) -> bool {
+        self.outgoing_queued || !self.outgoing_requests.is_empty()
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.outgoing_started() && !self.awaiting_incoming
+    }
+}
+
 /// Selection is stable even after fragments leave either queue.
 #[derive(Debug, Copy, Clone)]
 struct MessageToAbandon {
@@ -183,6 +214,15 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: HashMap<u32, ChunkReconfig>,
     reconfig_requests: HashMap<u32, ParamOutgoingResetRequest>,
+    /// Stream ids whose RFC 6525 reset has begun and not yet finished in both directions.
+    /// An id leaves this map, and [`StreamEvent::IdReleased`] fires, only once both have.
+    /// Bounded by the stream-id space.
+    stream_resets: FxHashMap<StreamId, StreamReset>,
+    /// Sequence numbers of the peer's reset requests already performed, newest last, so a
+    /// retransmitted request is answered again rather than performed again. Performing it again
+    /// would unregister whatever stream has since reused the id. Bounded by
+    /// [`PERFORMED_RESET_REQUESTS_KEPT`].
+    performed_peer_reset_requests: VecDeque<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -287,6 +327,8 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: HashMap::default(),
             reconfig_requests: HashMap::default(),
+            stream_resets: FxHashMap::default(),
+            performed_peer_reset_requests: VecDeque::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -733,8 +775,21 @@ impl Association {
 
             self.close_all_timers();
 
-            for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
-                self.unregister_stream(si, reason.clone());
+            let open: Vec<StreamId> = self.streams.keys().cloned().collect();
+            for si in &open {
+                self.unregister_stream(*si, reason.clone());
+            }
+
+            // With the association gone no reset can complete, and none is needed: every id it
+            // held, open or mid-reset, is free.
+            let mut released: Vec<StreamId> =
+                self.stream_resets.drain().map(|(id, _)| id).collect();
+            released.extend(open);
+            released.sort_unstable();
+            released.dedup();
+            for id in released {
+                self.events
+                    .push_back(Event::Stream(StreamEvent::IdReleased { id }));
             }
 
             debug!("[{}] association closed", self.side);
@@ -807,6 +862,12 @@ impl Association {
         }
     }
 
+    /// Whether `stream_identifier` is mid-reset: its reset has begun and has not yet finished in
+    /// both directions. [`StreamEvent::IdReleased`] fires when it finishes.
+    pub fn stream_reset_pending(&self, stream_identifier: StreamId) -> bool {
+        self.stream_resets.contains_key(&stream_identifier)
+    }
+
     /// The identifiers of every stream currently open on this association.
     pub fn stream_ids(&self) -> Vec<StreamId> {
         self.streams.keys().cloned().collect()
@@ -865,7 +926,7 @@ impl Association {
 
         let mut reply = vec![];
         for p in pending {
-            if let Err(err) = self.reset_streams_if_any(&p, true, &mut reply) {
+            if let Err(err) = self.reset_streams_if_any(&p, &mut reply) {
                 debug!("[{}] retry of deferred reset failed: {:?}", self.side, err);
             }
         }
@@ -1667,8 +1728,13 @@ impl Association {
 
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
                 self.reconfig_requests.values().cloned().collect();
+            // A request deferred because its data had not all arrived is performed here, and it
+            // must be answered with our own reset exactly as it would have been on arrival:
+            // without it the peer never sees our half, and the stream id is never released on
+            // either side. `reset_streams_if_any` sends that reset only for streams still
+            // registered whose reset we have not already started, so retrying is safe.
             for rst_req in rst_reqs {
-                self.reset_streams_if_any(&rst_req, false, &mut reply)?;
+                self.reset_streams_if_any(&rst_req, &mut reply)?;
             }
         }
 
@@ -1707,14 +1773,35 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            if self
+                .performed_peer_reset_requests
+                .contains(&p.reconfig_request_sequence_number)
+            {
+                // A retransmission: our answer was lost. Answer again, but do not perform it
+                // again — the ids it names may already belong to new streams (RFC 6525 §5.2.2).
+                debug!(
+                    "[{}] reset request {} already performed, answering again",
+                    self.side, p.reconfig_request_sequence_number
+                );
+                reply.push(self.reconfig_response_packet(
+                    p.reconfig_request_sequence_number,
+                    ReconfigResult::SuccessPerformed,
+                ));
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
-            self.reset_streams_if_any(p, true, reply)?;
+            self.reset_streams_if_any(p, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
             self.reconfigs.remove(&p.reconfig_response_sequence_number);
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
+            }
+            // "In progress" is not an answer: the peer performs the request later and then
+            // sends the final result for the same sequence number.
+            if p.result != ReconfigResult::InProgress {
+                self.on_outgoing_reset_answered(p.reconfig_response_sequence_number, p.result);
             }
             Ok(())
         } else {
@@ -2052,10 +2139,14 @@ impl Association {
             .collect()
     }
 
+    /// Performs the peer's reset request `p` if its data has all arrived and been collected,
+    /// queueing the response, and our own reset for each stream it closes, onto `reply`.
+    ///
+    /// Safe to call again for a request answered In Progress: a stream already unregistered is
+    /// neither reset nor answered twice.
     fn reset_streams_if_any(
         &mut self,
         p: &ParamOutgoingResetRequest,
-        respond: bool,
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         let mut result = ReconfigResult::SuccessPerformed;
@@ -2073,8 +2164,20 @@ impl Association {
                 if draining.contains(id) {
                     continue;
                 }
+                // The peer's outgoing stream is reset: that is our incoming half done. Every
+                // entry is created with our outgoing half started, so an entry also means our
+                // half is under way or already answered.
+                let ours_started = match self.stream_resets.get_mut(id) {
+                    Some(reset) => {
+                        reset.awaiting_incoming = false;
+                        true
+                    }
+                    None => false,
+                };
                 if self.streams.contains_key(id) {
-                    if respond {
+                    // Answer with our own reset (RFC 8831 §6.7) unless we started the close,
+                    // in which case ours has already gone.
+                    if !ours_started {
                         sis_to_reset.push(*id);
                     }
                     self.unregister_stream(*id, AssociationError::Reset);
@@ -2084,6 +2187,7 @@ impl Association {
             if draining.is_empty() {
                 self.reconfig_requests
                     .remove(&p.reconfig_request_sequence_number);
+                self.remember_performed_reset_request(p.reconfig_request_sequence_number);
             } else {
                 debug!(
                     "[{}] resetStream(): deferring reset of {:?}, application has not drained",
@@ -2105,6 +2209,17 @@ impl Association {
             let rsn = self.generate_next_rsn();
             let tsn = self.my_next_tsn - 1;
 
+            // The peer started this close, so its half is already done; ours starts now.
+            for id in &sis_to_reset {
+                self.stream_resets.insert(
+                    *id,
+                    StreamReset {
+                        outgoing_requests: vec![rsn],
+                        ..Default::default()
+                    },
+                );
+            }
+
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
                     reconfig_request_sequence_number: rsn,
@@ -2121,19 +2236,38 @@ impl Association {
             reply.push(p);
         }
 
-        let packet = self.create_packet(vec![Box::new(ChunkReconfig {
-            param_a: Some(Box::new(ParamReconfigResponse {
-                reconfig_response_sequence_number: p.reconfig_request_sequence_number,
-                result,
-            })),
-            param_b: None,
-        })]);
+        let packet = self.reconfig_response_packet(p.reconfig_request_sequence_number, result);
 
         debug!("[{}] RESET RESPONSE: {}", self.side, packet);
 
         reply.push(packet);
 
+        // Our incoming half may have been the last one outstanding.
+        for id in &p.stream_identifiers {
+            self.release_stream_id_if_reset(*id);
+        }
+
         Ok(())
+    }
+
+    fn reconfig_response_packet(&self, rsn: u32, result: ReconfigResult) -> Packet {
+        self.create_packet(vec![Box::new(ChunkReconfig {
+            param_a: Some(Box::new(ParamReconfigResponse {
+                reconfig_response_sequence_number: rsn,
+                result,
+            })),
+            param_b: None,
+        })])
+    }
+
+    fn remember_performed_reset_request(&mut self, rsn: u32) {
+        if self.performed_peer_reset_requests.contains(&rsn) {
+            return;
+        }
+        if self.performed_peer_reset_requests.len() == PERFORMED_RESET_REQUESTS_KEPT {
+            self.performed_peer_reset_requests.pop_front();
+        }
+        self.performed_peer_reset_requests.push_back(rsn);
     }
 
     /// create_packet wraps chunks in a packet.
@@ -2363,6 +2497,7 @@ impl Association {
                     sis_to_reset
                 );
 
+                self.track_outgoing_reset_request(rsn, &sis_to_reset);
                 let c = ChunkReconfig {
                     param_a: Some(Box::new(ParamOutgoingResetRequest {
                         reconfig_request_sequence_number: rsn,
@@ -3231,9 +3366,94 @@ impl Association {
 
         self.pending_queue
             .push_reset(ResetMarker { stream_identifier });
+
+        // We start the close, so the peer still owes us its half (RFC 8831 §6.7).
+        let reset = self
+            .stream_resets
+            .entry(stream_identifier)
+            .or_insert_with(|| StreamReset {
+                awaiting_incoming: true,
+                ..Default::default()
+            });
+        reset.outgoing_queued = true;
+
         self.awake_write_loop();
 
         Ok(())
+    }
+
+    /// Records that reset request `rsn`, naming `stream_identifiers`, has been sent and awaits
+    /// the peer's answer.
+    fn track_outgoing_reset_request(&mut self, rsn: u32, stream_identifiers: &[StreamId]) {
+        for id in stream_identifiers {
+            let reset = self.stream_resets.entry(*id).or_insert_with(|| {
+                // Every queued reset registers itself in `send_reset_request`; a request for an
+                // id with no entry would mean a reset left that path untracked.
+                debug_assert!(false, "reset request {rsn} for untracked stream {id}");
+                warn!(
+                    "[{}] reset request {} names stream {} with no reset in progress",
+                    self.side, rsn, id
+                );
+                StreamReset {
+                    awaiting_incoming: true,
+                    ..Default::default()
+                }
+            });
+            reset.outgoing_queued = false;
+            reset.outgoing_requests.push(rsn);
+        }
+    }
+
+    /// The peer answered our reset request `rsn` with a final `result`.
+    fn on_outgoing_reset_answered(&mut self, rsn: u32, result: ReconfigResult) {
+        if !matches!(
+            result,
+            ReconfigResult::SuccessPerformed | ReconfigResult::SuccessNop
+        ) {
+            // Nothing more will come for this request, so waiting on it would hold the ids
+            // forever. Treat it as finished, and say so.
+            warn!(
+                "[{}] peer refused stream reset request {}: {}",
+                self.side, rsn, result
+            );
+        }
+
+        let answered: Vec<StreamId> = self
+            .stream_resets
+            .iter_mut()
+            .filter_map(|(id, reset)| {
+                let before = reset.outgoing_requests.len();
+                reset.outgoing_requests.retain(|r| *r != rsn);
+                (reset.outgoing_requests.len() != before).then_some(*id)
+            })
+            .collect();
+        for id in answered {
+            self.release_stream_id_if_reset(id);
+        }
+    }
+
+    /// Releases `stream_identifier` for reuse if its reset has finished in both directions.
+    fn release_stream_id_if_reset(&mut self, stream_identifier: StreamId) {
+        let complete = self
+            .stream_resets
+            .get(&stream_identifier)
+            .is_some_and(StreamReset::is_complete);
+        if !complete {
+            return;
+        }
+        self.stream_resets.remove(&stream_identifier);
+        debug_assert!(
+            !self.streams.contains_key(&stream_identifier),
+            "stream {stream_identifier} released while still registered"
+        );
+        debug!(
+            "[{}] stream {} reset in both directions, id released",
+            self.side, stream_identifier
+        );
+        self.events
+            .push_back(Event::Stream(StreamEvent::IdReleased {
+                id: stream_identifier,
+            }));
     }
 
     /// Allocate an identity before consuming input or changing stream state.

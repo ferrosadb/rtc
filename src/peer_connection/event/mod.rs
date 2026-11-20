@@ -584,6 +584,17 @@ pub(crate) enum RTCEventInternal {
     /// - Stream ID
     SCTPStreamClosed(usize /*AssociationHandle*/, u16 /*StreamID*/),
 
+    /// A closed stream's id may be given to a new data channel again: its reset has completed
+    /// in both directions, or the association is gone.
+    ///
+    /// Until then the id stays reserved even though its channel has been removed, because a
+    /// late reset for it would tear down whatever reused it (RFC 8832 §6).
+    ///
+    /// Parameters:
+    /// - Association handle
+    /// - Stream ID
+    SCTPStreamIdReleased(usize /*AssociationHandle*/, u16 /*StreamID*/),
+
     /// SCTP released outgoing buffered bytes (acknowledged or abandoned) for a
     /// stream, used to decrement the per-channel send back-pressure counter.
     ///

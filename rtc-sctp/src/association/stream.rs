@@ -72,6 +72,18 @@ pub enum StreamEvent {
         /// User payload bytes released
         n_bytes: usize,
     },
+    /// The stream identifier may be used for a new stream again.
+    ///
+    /// Emitted once the RFC 6525 reset of the stream has completed in both directions — our
+    /// outgoing reset was answered and the peer's outgoing reset was performed — or when the
+    /// association closes with the reset still unfinished. RFC 8832 §6 allows a new data
+    /// channel only on an identifier "for which the corresponding incoming and outgoing streams
+    /// are unused"; until this event, they are not, and a late reset would tear down whatever
+    /// reused the identifier.
+    IdReleased {
+        /// The identifier that is free again
+        id: StreamId,
+    },
 }
 
 /// Reliability type for stream
