@@ -450,6 +450,16 @@ impl<'a>
                                     event: RTCEventInternal::SCTPBufferedAmountHigh(ch.0, id),
                                 });
                             }
+                            Event::Stream(StreamEvent::IdReleased { id }) => {
+                                debug!(
+                                    "association_handle {} stream id {} released for reuse",
+                                    ch.0, id
+                                );
+                                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
+                                    now,
+                                    event: RTCEventInternal::SCTPStreamIdReleased(ch.0, id),
+                                });
+                            }
                             Event::Stream(StreamEvent::BufferedAmountReleased { id, n_bytes }) => {
                                 // Forward the exact released byte count so the data
                                 // channel handler can decrement its synchronous
@@ -621,6 +631,15 @@ impl<'a>
                             );
                             let mut stream = conn.stream(message.stream_id)?;
                             stream.close(now)?;
+                            if !conn.stream_reset_pending(message.stream_id) {
+                                // The id stays reserved until SCTP releases it, and SCTP only
+                                // tracks streams it is resetting. Nothing will release this one.
+                                warn!(
+                                    "closing stream {} started no reset; its id stays reserved \
+                                     until the association closes",
+                                    message.stream_id
+                                );
+                            }
 
                             self.ctx.event_outs.push_back(TaggedRTCEventInternal {
                                 now,

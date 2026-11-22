@@ -452,10 +452,16 @@ impl<'a>
                 }
             }
 
+            // The channel goes now; its stream id stays reserved until SCTP releases it below.
             RTCEventInternal::SCTPStreamClosed(_association_handle, stream_id) => {
                 if let Some(dc) = self.data_channels.remove_by_stream(&stream_id) {
                     self.announce_closed(now, dc);
                 }
+            }
+
+            // Pure bookkeeping, like `SCTPBufferReleased`: not forwarded further.
+            RTCEventInternal::SCTPStreamIdReleased(_association_handle, stream_id) => {
+                self.data_channels.release_stream_id(&stream_id);
             }
 
             // The peer closed the DTLS transport, and with it the SCTP transport every channel
